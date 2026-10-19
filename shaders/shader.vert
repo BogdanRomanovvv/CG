@@ -18,6 +18,7 @@ layout(set = 1, binding = 0) uniform ModelUBO {
     mat4 model;
     vec4 albedo;
     vec4 specularAndShininess;
+    vec4 emission;
 } material;
 
 layout(location = 0) out vec3 worldPosition;

@@ -26,6 +26,7 @@ layout(set = 1, binding = 0) uniform ModelUBO {
     mat4 model;
     vec4 albedo;
     vec4 specularAndShininess;
+    vec4 emission;
 } material;
 
 layout(location = 0) in vec3 worldPosition;
@@ -43,6 +44,10 @@ vec3 evaluateBlinnPhong(vec3 N, vec3 V, vec3 L, vec3 radiance) {
 }
 
 void main() {
+    if (material.emission.a > 0.5) {
+        outColor = vec4(material.emission.rgb, 1.0);
+        return;
+    }
     vec3 N = normalize(worldNormal);
     vec3 V = normalize(scene.cameraPosition.xyz - worldPosition);
     vec3 baseColor = material.albedo.rgb * vertexColor;

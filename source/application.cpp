@@ -1,6 +1,7 @@
 #include "application.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -550,14 +551,21 @@ namespace
 		Mat4 model;
 		float albedo[4];
 		float specular_and_shininess[4];
+		float emission[4];
 	};
 	struct PointLightGPU { float position[4]; float color_intensity[4]; };
 	struct SpotLightGPU { float position[4]; float direction[4]; float color_intensity[4]; float cone_angles[4]; };
+	struct LightVisual
+	{
+		Buffer ubo;
+		VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+	};
 	struct PointLightSettings
 	{
 		Vec3 position{1.5f, 1.5f, 2.0f};
 		float color[3]{1.0f, 0.78f, 0.55f};
 		float intensity = 8.0f;
+		LightVisual marker;
 	};
 	struct SpotLightSettings
 	{
@@ -567,6 +575,7 @@ namespace
 		float intensity = 14.0f;
 		float inner_angle = 18.0f;
 		float outer_angle = 28.0f;
+		std::array<LightVisual, 5> visuals;
 	};
 
 	// Состояние объекта сцены и его Vulkan-ресурсы.
@@ -618,6 +627,7 @@ namespace
 	float directional_intensity = 1.2f;
 	std::vector<PointLightSettings> point_lights;
 	std::vector<SpotLightSettings> spot_lights;
+	bool show_light_visualizations = true;
 
 	// Анимация
 	bool animation_playing = true;
@@ -648,6 +658,69 @@ namespace
 	{
 		std::memcpy(buf.mapped, data, static_cast<size_t>(size));
 		vmaFlushAllocation(ctx.allocator, buf.allocation, 0, size);
+	}
+
+	bool create_light_visual(LightVisual &visual)
+	{
+		visual.ubo = create_buffer(sizeof(ModelUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
+		if (visual.ubo.buffer == VK_NULL_HANDLE) return false;
+		VkDescriptorSetAllocateInfo alloc{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+			.descriptorPool = descriptor_pool, .descriptorSetCount = 1, .pSetLayouts = &object_layout};
+		if (vkAllocateDescriptorSets(ctx.device, &alloc, &visual.descriptor_set) != VK_SUCCESS)
+		{
+			destroy_buffer(visual.ubo);
+			return false;
+		}
+		VkDescriptorBufferInfo info{visual.ubo.buffer, 0, sizeof(ModelUBO)};
+		VkWriteDescriptorSet write{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.dstSet = visual.descriptor_set, .dstBinding = 0, .descriptorCount = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &info};
+		vkUpdateDescriptorSets(ctx.device, 1, &write, 0, nullptr);
+		return true;
+	}
+
+	void destroy_light_visual(LightVisual &visual)
+	{
+		if (visual.descriptor_set != VK_NULL_HANDLE)
+		{
+			vkFreeDescriptorSets(ctx.device, descriptor_pool, 1, &visual.descriptor_set);
+			visual.descriptor_set = VK_NULL_HANDLE;
+		}
+		destroy_buffer(visual.ubo);
+	}
+
+	void destroy_point_light(PointLightSettings &light)
+	{
+		destroy_light_visual(light.marker);
+	}
+
+	void destroy_spot_light(SpotLightSettings &light)
+	{
+		for (LightVisual &visual : light.visuals) destroy_light_visual(visual);
+	}
+
+	Mat4 oriented_box(Vec3 center, Vec3 axis, float half_length, float half_width)
+	{
+		axis = normalize(axis);
+		const Vec3 reference = std::abs(axis.y) < 0.9f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+		const Vec3 right = normalize(cross(axis, reference));
+		const Vec3 up = normalize(cross(right, axis));
+		Mat4 model = identity();
+		model.m[0] = right.x * half_width; model.m[1] = right.y * half_width; model.m[2] = right.z * half_width;
+		model.m[4] = up.x * half_width; model.m[5] = up.y * half_width; model.m[6] = up.z * half_width;
+		model.m[8] = axis.x * half_length; model.m[9] = axis.y * half_length; model.m[10] = axis.z * half_length;
+		model.m[12] = center.x; model.m[13] = center.y; model.m[14] = center.z;
+		return model;
+	}
+
+	void write_emissive_visual(LightVisual &visual, const Mat4 &model, const float color[3])
+	{
+		ModelUBO ubo{};
+		ubo.model = model;
+		ubo.albedo[0] = ubo.albedo[1] = ubo.albedo[2] = 1.0f;
+		ubo.specular_and_shininess[3] = 1.0f;
+		ubo.emission[0] = color[0]; ubo.emission[1] = color[1]; ubo.emission[2] = color[2]; ubo.emission[3] = 1.0f;
+		write_ubo(visual.ubo, &ubo, sizeof(ModelUBO));
 	}
 
 	VkDeviceSize light_buffer_size(size_t count, size_t item_size)
@@ -771,13 +844,15 @@ namespace application
 
 		// 4. Пул дескрипторов: один набор для камеры и отдельный набор для каждого объекта.
 		const uint32_t object_count = static_cast<uint32_t>(objects.size());
+		constexpr uint32_t visual_descriptor_capacity = 4096;
 		VkDescriptorPoolSize pool_sizes[] = {
-			{.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = object_count + 1},
+			{.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = object_count + 1 + visual_descriptor_capacity},
 			{.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2},
 		};
 		VkDescriptorPoolCreateInfo pool_create = {
 			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-			.maxSets = object_count + 1,
+			.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+			.maxSets = object_count + 1 + visual_descriptor_capacity,
 			.poolSizeCount = 2,
 			.pPoolSizes = pool_sizes,
 		};
@@ -1029,6 +1104,8 @@ namespace application
 			destroy_mesh(obj.mesh);
 			destroy_buffer(obj.ubo);
 		}
+		for (PointLightSettings &light : point_lights) destroy_point_light(light);
+		for (SpotLightSettings &light : spot_lights) destroy_spot_light(light);
 		destroy_buffer(camera_ubo);
 		destroy_buffer(point_light_ssbo);
 		destroy_buffer(spot_light_ssbo);
@@ -1140,7 +1217,12 @@ namespace application
 
 		ImGui::Separator();
 		ImGui::Text("Point lights (inverse-square falloff)");
-		if (ImGui::Button("Add point light")) point_lights.emplace_back();
+		ImGui::Checkbox("Show light visualizations", &show_light_visualizations);
+		if (ImGui::Button("Add point light"))
+		{
+			PointLightSettings light{};
+			if (create_light_visual(light.marker)) point_lights.push_back(light);
+		}
 		for (size_t i = 0; i < point_lights.size(); ++i)
 		{
 			ImGui::PushID(static_cast<int>(i));
@@ -1150,7 +1232,13 @@ namespace application
 				ImGui::DragFloat3("Position", &light.position.x, 0.05f, -8.0f, 8.0f);
 				ImGui::ColorEdit3("Color", light.color);
 				ImGui::SliderFloat("Intensity", &light.intensity, 0.0f, 80.0f);
-				if (ImGui::Button("Remove point light")) { point_lights.erase(point_lights.begin() + i); ImGui::TreePop(); ImGui::PopID(); break; }
+				if (ImGui::Button("Remove point light"))
+				{
+					vkQueueWaitIdle(ctx.graphics_queue);
+					destroy_point_light(light);
+					point_lights.erase(point_lights.begin() + i);
+					ImGui::TreePop(); ImGui::PopID(); break;
+				}
 				ImGui::TreePop();
 			}
 			ImGui::PopID();
@@ -1158,7 +1246,14 @@ namespace application
 
 		ImGui::Separator();
 		ImGui::Text("Spot lights (inverse-square falloff)");
-		if (ImGui::Button("Add spot light")) spot_lights.emplace_back();
+		if (ImGui::Button("Add spot light"))
+		{
+			SpotLightSettings light{};
+			bool ready = true;
+			for (LightVisual &visual : light.visuals) ready = create_light_visual(visual) && ready;
+			if (ready) spot_lights.push_back(light);
+			else for (LightVisual &visual : light.visuals) destroy_light_visual(visual);
+		}
 		for (size_t i = 0; i < spot_lights.size(); ++i)
 		{
 			ImGui::PushID(static_cast<int>(i));
@@ -1171,7 +1266,13 @@ namespace application
 				ImGui::SliderFloat("Intensity", &light.intensity, 0.0f, 120.0f);
 				ImGui::SliderFloat("Inner angle", &light.inner_angle, 1.0f, light.outer_angle);
 				ImGui::SliderFloat("Outer angle", &light.outer_angle, light.inner_angle, 89.0f);
-				if (ImGui::Button("Remove spot light")) { spot_lights.erase(spot_lights.begin() + i); ImGui::TreePop(); ImGui::PopID(); break; }
+				if (ImGui::Button("Remove spot light"))
+				{
+					vkQueueWaitIdle(ctx.graphics_queue);
+					destroy_spot_light(light);
+					spot_lights.erase(spot_lights.begin() + i);
+					ImGui::TreePop(); ImGui::PopID(); break;
+				}
 				ImGui::TreePop();
 			}
 			ImGui::PopID();
@@ -1306,6 +1407,34 @@ namespace application
 		if (!point_gpu.empty()) write_ubo(point_light_ssbo, point_gpu.data(), point_gpu.size() * sizeof(PointLightGPU));
 		if (!spot_gpu.empty()) write_ubo(spot_light_ssbo, spot_gpu.data(), spot_gpu.size() * sizeof(SpotLightGPU));
 
+		const float white[3]{1.0f, 1.0f, 1.0f};
+		for (PointLightSettings &light : point_lights)
+		{
+			Mat4 marker = multiply(translate(light.position), scale({0.11f, 0.11f, 0.11f}));
+			write_emissive_visual(light.marker, marker, light.color);
+		}
+		for (SpotLightSettings &light : spot_lights)
+		{
+			Mat4 marker = multiply(translate(light.position), scale({0.13f, 0.13f, 0.13f}));
+			write_emissive_visual(light.visuals[0], marker, light.color);
+			const Vec3 direction = normalize(light.direction);
+			const Vec3 reference = std::abs(direction.y) < 0.9f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+			const Vec3 axis_u = normalize(cross(direction, reference));
+			const Vec3 axis_v = normalize(cross(direction, axis_u));
+			constexpr float cone_depth = 1.8f;
+			const float cone_radius = std::tan(radians(light.outer_angle)) * cone_depth;
+			for (int edge = 0; edge < 4; ++edge)
+			{
+				const float angle = static_cast<float>(edge) * 1.57079632679f;
+				const Vec3 radial = axis_u * std::cos(angle) + axis_v * std::sin(angle);
+				const Vec3 endpoint = light.position + direction * cone_depth + radial * cone_radius;
+				const Vec3 segment = endpoint - light.position;
+				const Mat4 beam = oriented_box(light.position + segment * 0.5f, segment,
+					0.5f * std::sqrt(dot(segment, segment)), 0.012f);
+				write_emissive_visual(light.visuals[edge + 1], beam, white);
+			}
+		}
+
 		// Обновление модельной матрицы и цвета каждого объекта.
 		for (Object &obj : objects)
 		{
@@ -1379,6 +1508,22 @@ namespace application
 			VkDeviceSize offset = 0;
 			vkCmdBindVertexBuffers(cb, 0, 1, &obj.mesh.buffer, &offset);
 			vkCmdDraw(cb, obj.mesh.vertex_count, 1, 0, 0);
+		}
+
+		if (show_light_visualizations)
+		{
+			const Mesh &marker_mesh = objects[1].mesh;
+			VkDeviceSize marker_offset = 0;
+			vkCmdBindVertexBuffers(cb, 0, 1, &marker_mesh.buffer, &marker_offset);
+			auto draw_visual = [&](const LightVisual &visual)
+			{
+				vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+					1, 1, &visual.descriptor_set, 0, nullptr);
+				vkCmdDraw(cb, marker_mesh.vertex_count, 1, 0, 0);
+			};
+			for (const PointLightSettings &light : point_lights) draw_visual(light.marker);
+			for (const SpotLightSettings &light : spot_lights)
+				for (const LightVisual &visual : light.visuals) draw_visual(visual);
 		}
 
 		vkCmdEndRenderPass(cb);
