@@ -1,5 +1,6 @@
 #version 450
 
+// Форматы структур должны совпадать с PointLightGPU и SpotLightGPU в C++.
 struct PointLight {
     vec4 position;
     vec4 colorIntensity;
@@ -11,6 +12,7 @@ struct SpotLight {
     vec4 coneAngles;
 };
 
+// Общий uniform-буфер сцены; значения приходят из набора set 0, binding 0.
 layout(set = 0, binding = 0) uniform SceneUBO {
     mat4 view;
     mat4 proj;
@@ -20,9 +22,10 @@ layout(set = 0, binding = 0) uniform SceneUBO {
     vec4 directionalColor;
     uvec4 lightCounts;
 } scene;
-// Runtime-массивы не задают максимальное число источников на стороне шейдера.
+// Runtime-массивы в storage buffers: размер задаётся CPU, фиксированного лимита в GLSL нет.
 layout(set = 0, binding = 1, std430) readonly buffer PointLightBuffer { PointLight pointLights[]; } points;
 layout(set = 0, binding = 2, std430) readonly buffer SpotLightBuffer { SpotLight spotLights[]; } spots;
+// Материал текущей модели — отдельный набор set 1.
 layout(set = 1, binding = 0) uniform ModelUBO {
     mat4 model;
     vec4 albedo;
@@ -35,6 +38,8 @@ layout(location = 1) in vec3 worldNormal;
 layout(location = 2) in vec3 vertexColor;
 layout(location = 0) out vec4 outColor;
 
+// Считает диффузную и зеркальную составляющие для одного направления света.
+// N — нормаль поверхности, V — направление к камере, L — направление к свету.
 vec3 evaluateBlinnPhong(vec3 N, vec3 V, vec3 L, vec3 radiance) {
     // Диффузная часть использует N·L, а блик — half-вектор между взглядом и светом.
     float nDotL = max(dot(N, L), 0.0);
@@ -42,6 +47,7 @@ vec3 evaluateBlinnPhong(vec3 N, vec3 V, vec3 L, vec3 radiance) {
     float specular = nDotL > 0.0
         ? pow(max(dot(N, H), 0.0), max(material.specularAndShininess.w, 1.0))
         : 0.0;
+    // Shininess задаёт степень: чем она выше, тем уже и резче блик.
     return (material.albedo.rgb * vertexColor * nDotL + material.specularAndShininess.rgb * specular) * radiance;
 }
 
@@ -52,13 +58,17 @@ void main() {
         return;
     }
     vec3 N = normalize(worldNormal);
+    // Направление от текущего фрагмента к наблюдателю.
     vec3 V = normalize(scene.cameraPosition.xyz - worldPosition);
     vec3 baseColor = material.albedo.rgb * vertexColor;
+    // Ambient не зависит от ориентации поверхности и добавляется один раз.
     vec3 result = baseColor * scene.ambient.rgb * scene.ambient.a;
 
+    // Направленный свет одинаково освещает все точки сцены, затухания по расстоянию нет.
     vec3 dirL = normalize(-scene.directionalDirection.xyz);
     result += evaluateBlinnPhong(N, V, dirL, scene.directionalColor.rgb * scene.directionalColor.a);
 
+    // Каждый точечный источник освещает поверхность из своей позиции во все стороны.
     for (uint i = 0; i < scene.lightCounts.x; ++i) {
         PointLight light = points.pointLights[i];
         vec3 delta = light.position.xyz - worldPosition;
@@ -68,6 +78,7 @@ void main() {
             light.colorIntensity.rgb * light.colorIntensity.a / distanceSquared);
     }
 
+    // Прожектор использует такое же затухание, дополнительно ограничивая вклад конусом.
     for (uint i = 0; i < scene.lightCounts.y; ++i) {
         SpotLight light = spots.spotLights[i];
         vec3 delta = light.position.xyz - worldPosition;
@@ -80,5 +91,6 @@ void main() {
             light.colorIntensity.rgb * light.colorIntensity.a * cone / distanceSquared);
     }
 
+    // Записываем суммарный цвет ambient, направленного, точечного и прожекторного света.
     outColor = vec4(result, 1.0);
 }
