@@ -20,6 +20,7 @@ layout(set = 0, binding = 0) uniform SceneUBO {
     vec4 directionalColor;
     uvec4 lightCounts;
 } scene;
+// Runtime-массивы не задают максимальное число источников на стороне шейдера.
 layout(set = 0, binding = 1, std430) readonly buffer PointLightBuffer { PointLight pointLights[]; } points;
 layout(set = 0, binding = 2, std430) readonly buffer SpotLightBuffer { SpotLight spotLights[]; } spots;
 layout(set = 1, binding = 0) uniform ModelUBO {
@@ -35,6 +36,7 @@ layout(location = 2) in vec3 vertexColor;
 layout(location = 0) out vec4 outColor;
 
 vec3 evaluateBlinnPhong(vec3 N, vec3 V, vec3 L, vec3 radiance) {
+    // Диффузная часть использует N·L, а блик — half-вектор между взглядом и светом.
     float nDotL = max(dot(N, L), 0.0);
     vec3 H = normalize(L + V);
     float specular = nDotL > 0.0
@@ -45,6 +47,7 @@ vec3 evaluateBlinnPhong(vec3 N, vec3 V, vec3 L, vec3 radiance) {
 
 void main() {
     if (material.emission.a > 0.5) {
+        // Для маркеров и линий сразу выводим постоянный emission-цвет.
         outColor = vec4(material.emission.rgb, 1.0);
         return;
     }
@@ -60,6 +63,7 @@ void main() {
         PointLight light = points.pointLights[i];
         vec3 delta = light.position.xyz - worldPosition;
         float distanceSquared = max(dot(delta, delta), 0.0001);
+        // Точечный свет ослабевает обратно пропорционально квадрату расстояния.
         result += evaluateBlinnPhong(N, V, normalize(delta),
             light.colorIntensity.rgb * light.colorIntensity.a / distanceSquared);
     }
@@ -70,6 +74,7 @@ void main() {
         float distanceSquared = max(dot(delta, delta), 0.0001);
         vec3 fromLight = -normalize(delta);
         float theta = dot(fromLight, normalize(light.direction.xyz));
+        // Плавно переходим от полного света внутри внутреннего угла к нулю снаружи.
         float cone = smoothstep(light.coneAngles.y, light.coneAngles.x, theta);
         result += evaluateBlinnPhong(N, V, normalize(delta),
             light.colorIntensity.rgb * light.colorIntensity.a * cone / distanceSquared);

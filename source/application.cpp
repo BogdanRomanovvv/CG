@@ -536,7 +536,8 @@ namespace
 
 	// Состояние сцены
 
-	// Общие параметры камеры и освещения передаются в наборе сцены.
+	// Общие параметры камеры и освещения передаются в наборе сцены (set 0).
+	// Массив light_counts сообщает шейдеру, сколько источников реально записано в SSBO.
 	struct SceneUBO
 	{
 		Mat4 view, proj;
@@ -546,6 +547,7 @@ namespace
 		float directional_color[4];
 		uint32_t light_counts[4];
 	};
+	// Параметры одной модели хранятся отдельно в наборе set 1.
 	struct ModelUBO
 	{
 		Mat4 model;
@@ -553,6 +555,7 @@ namespace
 		float specular_and_shininess[4];
 		float emission[4];
 	};
+	// Упакованные структуры должны совпадать по расположению полей с GLSL std430.
 	struct PointLightGPU { float position[4]; float color_intensity[4]; };
 	struct SpotLightGPU { float position[4]; float direction[4]; float color_intensity[4]; float cone_angles[4]; };
 	struct LightVisual
@@ -662,6 +665,7 @@ namespace
 
 	bool create_light_visual(LightVisual &visual)
 	{
+		// У каждого маркера свой UBO и дескриптор, чтобы фигуры могли иметь разные цвета и матрицы.
 		visual.ubo = create_buffer(sizeof(ModelUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
 		if (visual.ubo.buffer == VK_NULL_HANDLE) return false;
 		VkDescriptorSetAllocateInfo alloc{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -715,6 +719,7 @@ namespace
 
 	void write_emissive_visual(LightVisual &visual, const Mat4 &model, const float color[3])
 	{
+		// Флаг emission переключает фрагментный шейдер на прямой вывод цвета без освещения.
 		ModelUBO ubo{};
 		ubo.model = model;
 		ubo.albedo[0] = ubo.albedo[1] = ubo.albedo[2] = 1.0f;
@@ -730,6 +735,7 @@ namespace
 
 	void ensure_light_buffers()
 	{
+		// Увеличиваем SSBO только когда список источников перестал помещаться в текущую ёмкость.
 		const VkDeviceSize point_size = light_buffer_size(point_lights.size(), sizeof(PointLightGPU));
 		const VkDeviceSize spot_size = light_buffer_size(spot_lights.size(), sizeof(SpotLightGPU));
 		if (point_size <= point_light_capacity && spot_size <= spot_light_capacity)
@@ -806,6 +812,7 @@ namespace application
 		objects[2].visible = true;
 
 		// 3. Макеты наборов дескрипторов: set 0 для камеры и set 1 для объектов.
+		// set 0: общие данные сцены и два storage buffer; set 1 ниже — параметры модели.
 		VkDescriptorSetLayoutBinding scene_bindings[] = {
 			{.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
 			 .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT},
@@ -1216,6 +1223,7 @@ namespace application
 		ImGui::SliderFloat("Directional intensity", &directional_intensity, 0.0f, 8.0f);
 
 		ImGui::Separator();
+		// Изменение списков здесь отражается в SSBO при подготовке следующего кадра.
 		ImGui::Text("Point lights (inverse-square falloff)");
 		ImGui::Checkbox("Show light visualizations", &show_light_visualizations);
 		if (ImGui::Button("Add point light"))
@@ -1354,6 +1362,7 @@ namespace application
 		const float pitch = radians(camera_pitch);
 		const Vec3 forward{std::sin(yaw) * std::cos(pitch), std::sin(pitch), -std::cos(yaw) * std::cos(pitch)};
 		camera_center = camera_eye + forward;
+		// Заполняем общий UBO камеры и света; он используется обеими стадиями шейдера.
 		SceneUBO camera{};
 		camera.view = look_at(camera_eye, camera_center, camera_up);
 		if (use_perspective)
@@ -1384,6 +1393,7 @@ namespace application
 		write_ubo(camera_ubo, &camera, sizeof(SceneUBO));
 
 		ensure_light_buffers();
+		// Конвертируем настройки ImGui в компактные структуры, ожидаемые GLSL-массивами.
 		std::vector<PointLightGPU> point_gpu(point_lights.size());
 		for (size_t i = 0; i < point_lights.size(); ++i)
 		{
@@ -1407,6 +1417,7 @@ namespace application
 		if (!point_gpu.empty()) write_ubo(point_light_ssbo, point_gpu.data(), point_gpu.size() * sizeof(PointLightGPU));
 		if (!spot_gpu.empty()) write_ubo(spot_light_ssbo, spot_gpu.data(), spot_gpu.size() * sizeof(SpotLightGPU));
 
+		// Маркеры копируют выбранный цвет источника, а четыре белых ребра показывают внешний конус spot.
 		const float white[3]{1.0f, 1.0f, 1.0f};
 		for (PointLightSettings &light : point_lights)
 		{
@@ -1422,6 +1433,7 @@ namespace application
 			const Vec3 axis_u = normalize(cross(direction, reference));
 			const Vec3 axis_v = normalize(cross(direction, axis_u));
 			constexpr float cone_depth = 1.8f;
+			// На фиксированной глубине строим радиус конуса из его внешнего угла.
 			const float cone_radius = std::tan(radians(light.outer_angle)) * cone_depth;
 			for (int edge = 0; edge < 4; ++edge)
 			{
@@ -1510,6 +1522,7 @@ namespace application
 			vkCmdDraw(cb, obj.mesh.vertex_count, 1, 0, 0);
 		}
 
+		// Визуализации рисуются тем же мешем, но emissive-ветка шейдера не освещает их.
 		if (show_light_visualizations)
 		{
 			const Mesh &marker_mesh = objects[1].mesh;

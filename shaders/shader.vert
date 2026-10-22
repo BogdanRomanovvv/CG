@@ -28,7 +28,9 @@ layout(location = 2) out vec3 vertexColor;
 void main() {
     vec4 world = material.model * vec4(inPosition, 1.0);
     worldPosition = world.xyz;
+    // Обратная транспонированная матрица сохраняет нормаль при неравномерном масштабе.
     worldNormal = normalize(transpose(inverse(mat3(material.model))) * inNormal);
     vertexColor = inColor;
+    // Переводим вершину из локального пространства модели в пространство клиппинга.
     gl_Position = scene.proj * scene.view * world;
 }
